@@ -1,7 +1,7 @@
-Forked from https://github.com/saermart/DouyinLiveWebFetcher  \
+Forked from https://github.com/saermart/DouyinLiveWebFetcher 
 
 Side project because of interest, no intent to update regularly \
-Not meant for commercial use  \
+Not meant for commercial use 
 
 Changes:  \
 added quite a bit of changes \
@@ -13,5 +13,6 @@ better chat features \
 better heartbeat changes \
 more persistent connection \
 added watchdogs to restart connection if dropped
+
 
 

@@ -19,10 +19,10 @@ import execjs
 import urllib.parse
 from contextlib import contextmanager
 from unittest.mock import patch
-import sys
 import io
 import os
-
+import logging
+import sys
 import requests
 import websocket
 from py_mini_racer import MiniRacer
@@ -38,6 +38,59 @@ import yaml
 from collections import defaultdict
 from typing import Dict, Any, Tuple, Optional
 
+import logging
+import sys
+
+def _ensure_utf8_console():
+    """Best-effort UTF-8 console output on Windows to avoid charmap crashes."""
+    if sys.platform != "win32":
+        return
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+            continue
+        except Exception:
+            pass
+
+        try:
+            if hasattr(stream, "buffer"):
+                wrapped = io.TextIOWrapper(stream.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+                setattr(sys, stream_name, wrapped)
+        except Exception:
+            pass
+
+def _safe_log_text(value):
+    """Always return a printable UTF-8-safe string."""
+    try:
+        text = str(value)
+    except Exception:
+        text = repr(value)
+    return text.encode('utf-8', errors='replace').decode('utf-8')
+
+# --- 核心修复：强制控制台输出使用 UTF-8 并安全替换非法字符 ---
+_ensure_utf8_console()
+
+# --- 日志配置 ---
+logger = logging.getLogger("DouyinFetcher")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    # 文件处理器：保存所有原始数据
+    file_handler = logging.FileHandler("live_output.log", encoding="utf-8")
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter) # Corrected from set_formatter to setFormatter
+
+    # 控制台处理器：显示输出
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(file_formatter) # Corrected from set_formatter to setFormatter
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
 def parse_chinese_number(text): #万转成数字
     try:
@@ -61,7 +114,8 @@ def execute_js(js_file: str):
     with open(js_file, 'r', encoding='utf-8') as file:
         js_code = file.read()
     
-    ctx = execjs.compile(js_code)
+    with patched_popen_encoding('utf-8'):
+        ctx = execjs.compile(js_code)
     return ctx
 
 diamond_totals = defaultdict(lambda: {"name": "", "diamonds": 0})
@@ -95,9 +149,9 @@ def generateSignature(wss, script_file='sign.js'):
             ctx = MiniRacer()
             ctx.eval(script)
             _signature_ctx = ctx
-            print(f"【√】Signature JS Context initialized.", flush=True)
+            logger.info(f"【√】Signature JS Context initialized.")
         except Exception as e:
-            print(f"【X】Signature JS Context initialization failed: {e}", flush=True)
+            logger.info(f"【X】Signature JS Context initialization failed: {e}")
             return "" # Return empty string on failure
 
     params = ("live_id,aid,version_code,webcast_sdk_version,"
@@ -116,7 +170,7 @@ def generateSignature(wss, script_file='sign.js'):
         signature = _signature_ctx.call("get_sign", md5_param)
         return signature
     except Exception as e:
-        print(f"【X】Signature calculation error: {e}") # Print the error to console
+        logger.info(f"【X】Signature calculation error: {e}") # Print the error to console
         return ""
 
 
@@ -144,6 +198,7 @@ class DouyinLiveWebFetcher:
         self.live_id = live_id
         self.host = "https://www.douyin.com/"
         self.live_url = "https://live.douyin.com/"
+        self.user_unique_id = ''.join(random.choices(string.digits, k=19))
         
         # User Agent Rotation for robustness
         desktop_uas = [
@@ -187,11 +242,18 @@ class DouyinLiveWebFetcher:
         self.retry_on_failure = self.handler_config.get("retry_on_failure", True)
         self.max_retries = self.handler_config.get("max_retries", 3)
         self.retry_delay_seconds = self.handler_config.get("retry_delay_seconds", 10)
+        self.auth_cookie = (self.handler_config.get("auth_cookie") or "").strip()
         
         # --- MERGED RECONNECTION / CONTROL FLAGS (from File 2 logic) ---
         self._running = True        # Flag to control overall execution
         self._disconnect_count = 0  # Counter for consecutive disconnections/failures
         self._mail_sent = False     # Flag for notification status
+        self._incoming_frame_count = 0
+        self._last_incoming_log_time = 0.0
+        self._parsed_message_count = 0
+        self._hb_frame_count = 0
+        self._data_frame_count = 0
+        self._debug_data_logs = 0
 
         self.logging_cfg = self.handler_config.get("logging", {})
         self.log_folder = self.logging_cfg.get("folder", "logs")
@@ -219,14 +281,14 @@ class DouyinLiveWebFetcher:
         """Notification logic (Placeholder, user requested to exclude send_mail.py)."""
         self._mail_sent = True
         msg = "【!】连续连接失败次数超过 5 次，已触发通知 (未发送邮件，请检查网络或配置)."
-        print(msg)
+        logger.info(msg)
 
 
     def _set_stream_session_id(self):
         """Generates a unique ID for this script execution session (stream)."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.stream_session_id = f"{self.live_id}_{timestamp}"
-        print(f"【Stream Session ID】Set for current session: {self.live_id}_{timestamp}")
+        logger.info(f"【Stream Session ID】Set for current session: {self.live_id}_{timestamp}")
             
     def start(self, retry_interval=5):
             """
@@ -241,11 +303,11 @@ class DouyinLiveWebFetcher:
                     if not self._running:
                         break
                     msg = f"【X】WebSocket主循环异常: {e}"
-                    print(msg)
+                    logger.info(msg)
 
                 if self._running:
                     msg = f"【!】连接已断开或结束，{self.retry_delay_seconds} 秒后尝试重新进入直播间..."
-                    print(msg)
+                    logger.info(msg)
                     time.sleep(self.retry_delay_seconds)
         
     def stop(self):
@@ -269,7 +331,7 @@ class DouyinLiveWebFetcher:
             response = self.session.get(self.live_url, headers=headers)
             response.raise_for_status()
         except Exception as err:
-            print("【X】Request the live url error: ", err)
+            logger.info("【X】Request the live url error: ", err)
         else:
             self.__ttwid = response.cookies.get('ttwid')
             return self.__ttwid
@@ -281,17 +343,17 @@ class DouyinLiveWebFetcher:
         url = self.live_url + self.live_id
         headers = {
             "User-Agent": self.user_agent,
-            "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; __ac_nonce=0123407cc00a9e438deb4",
+            "cookie": self.auth_cookie if self.auth_cookie else f"ttwid={self.ttwid}; msToken={generateMsToken()}; __ac_nonce=0123407cc00a9e438deb4",
         }
         try:
             response = self.session.get(url, headers=headers)
             response.raise_for_status()
         except Exception as err:
-            print("【X】Request the live room url error: ", err)
+            logger.info("【X】Request the live room url error: ", err)
         else:
             match = re.search(r'roomId\\":\\"(\d+)\\"', response.text)
             if match is None or len(match.groups()) < 1:
-                print("【X】No match found for roomId")
+                logger.info("【X】No match found for roomId")
             
             self.__room_id = match.group(1)
             
@@ -310,7 +372,8 @@ class DouyinLiveWebFetcher:
     def get_a_bogus(self, url_params: dict):
         url = urllib.parse.urlencode(url_params)
         ctx = execute_js(self.abogus_file)
-        _a_bogus = ctx.call("get_ab", url, self.user_agent)
+        with patched_popen_encoding('utf-8'):
+            _a_bogus = ctx.call("get_ab", url, self.user_agent)
         return _a_bogus
     
     def get_room_status(self):
@@ -329,9 +392,10 @@ class DouyinLiveWebFetcher:
         a_bogus = self.get_a_bogus(params)  # 计算a_bogus,成功率不是100%，出现失败时重试即可
         url += f"&a_bogus={a_bogus}"
         headers = self.headers.copy()
+        cookie_header = self.auth_cookie if self.auth_cookie else f'ttwid={self.ttwid};__ac_nonce={nonce}; __ac_signature={signature}'
         headers.update({
             'Referer': f'https://live.douyin.com/{self.live_id}',
-            'Cookie': f'ttwid={self.ttwid};__ac_nonce={nonce}; __ac_signature={signature}',
+            'Cookie': cookie_header,
         })
         resp = self.session.get(url, headers=headers)
         data = resp.json().get('data')
@@ -343,7 +407,7 @@ class DouyinLiveWebFetcher:
 
             self.streamer_name = nickname  
 
-            print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
+            logger.info(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
             return room_status
 
 
@@ -359,6 +423,11 @@ class DouyinLiveWebFetcher:
             attempt = 0
             while attempt < self.max_retries and self._running:
                 try:
+                    # Build fresh auth context for each connection attempt
+                    ms_token = generateMsToken()
+                    ac_nonce = self.get_ac_nonce()
+                    ac_signature = self.get_ac_signature(ac_nonce)
+
                     # Dynamic WSS URL Timestamps for fresh connection
                     current_ms = int(time.time() * 1000)
                     cursor_fetch_time = current_ms - 100 
@@ -373,43 +442,48 @@ class DouyinLiveWebFetcher:
                         "&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,"
                         "%20like%20Gecko)%20Chrome/126.0.0.0%20Safari/537.36"
                         "&browser_online=true&tz_name=Asia/Shanghai"
-                        f"&cursor=d-1_u-1_fh-7392091211001140287_t-{cursor_fetch_time}_r-1"
-                        f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:7319483754668557238"
-                        f"|first_req_ms:{first_req_ms}|fetch_time:{cursor_fetch_time}|seq:1|wss_info:0-{cursor_fetch_time}-0-0|"
-                        f"wrds_v:7392094459690748497"
+                        f"&cursor=d-1_u-1_fh-0_t-{cursor_fetch_time}_r-1"
+                        f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:{self.user_unique_id}"
+                        f"|first_req_ms:{first_req_ms}|fetch_time:{cursor_fetch_time}|seq:1"
                         f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
-                        f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
+                        f"&user_unique_id={self.user_unique_id}&im_path=/webcast/im/fetch/&identity=audience"
                         f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self.room_id}&heartbeatDuration=0"
+                        f"&msToken={ms_token}"
                     )
 
                     signature = generateSignature(wss)
                     wss += f"&signature={signature}"
 
+                    cookie_header = self.auth_cookie if self.auth_cookie else f"ttwid={self.ttwid}; msToken={ms_token}; __ac_nonce={ac_nonce}; __ac_signature={ac_signature}"
+
                     headers = {
-                        "cookie": f"ttwid={self.ttwid}",
+                        "cookie": cookie_header,
                         'user-agent': self.user_agent,
+                        'origin': 'https://live.douyin.com',
+                        'referer': f'https://live.douyin.com/{self.live_id}',
                     }
 
                     self.ws = websocket.WebSocketApp(
                         wss,
                         header=headers,
                         on_open=self._wsOnOpen,
+                        on_data=self._wsOnData,
                         on_message=self._wsOnMessage,
                         on_error=self._wsOnError,
                         on_close=self._wsOnClose
                     )
 
-                    print(f"【连接尝试】第 {attempt + 1} 次连接 WebSocket...")
+                    logger.info(f"【连接尝试】第 {attempt + 1} 次连接 WebSocket...")
                     # Ensure last_message_time is reset at the moment of connection attempt
                     self.last_message_time = time.time()
                     self.ws.run_forever()
                     break # If run_forever returns (closed), break the retry loop
 
                 except Exception as e:
-                    print(f"【连接失败】{e}")
+                    logger.info(f"【连接失败】{e}")
                     attempt += 1
                     if not self.retry_on_failure or attempt >= self.max_retries:
-                        print("【终止】已达到最大重试次数或关闭重试功能。")
+                        logger.info("【终止】已达到最大重试次数或关闭重试功能。")
                         
                         # Track persistent failure
                         self._disconnect_count += 1 
@@ -417,81 +491,122 @@ class DouyinLiveWebFetcher:
                             self._notify_disconnect()
                             
                         break # Exit retry loop
-                    print(f"【重试中】将在 {self.retry_delay_seconds} 秒后重试...")
+                    logger.info(f"【重试中】将在 {self.retry_delay_seconds} 秒后重试...")
                     time.sleep(self.retry_delay_seconds)
                     
             if not self._running:
-                print("【_connectWebSocket】程序已通过外部调用停止。")
+                logger.info("【_connectWebSocket】程序已通过外部调用停止。")
     def _sendHeartbeat(self):
         # Optimized with error handling for stability
         while True:
             try:
                 # Check if WebSocket object exists and is connected
                 if not hasattr(self, 'ws') or not getattr(self.ws, 'sock', None) or not self.ws.sock.connected:
-                    print("【X】心跳线程退出: WebSocket连接已断开。", flush=True)
+                    logger.info("【X】心跳线程退出: WebSocket连接已断开。")
                     break
                     
                 heartbeat = PushFrame(payload_type='hb').SerializeToString()
                 self.ws.send(heartbeat, websocket.ABNF.OPCODE_BINARY) 
-                print("【√】发送心跳包")
+                logger.info("【√】发送心跳包")
                 
             except websocket.WebSocketConnectionClosedException:
-                 print("【X】心跳线程退出: WebSocket连接已关闭。", flush=True)
-                 break
+                logger.info("【X】心跳线程退出: WebSocket连接已关闭。")
+                break
             except Exception as e:
-                print(f"【X】心跳包检测错误: {e}")
+                logger.info(f"【X】心跳包检测错误: {e}")
                 break
             else:
                 time.sleep(self.heartbeat_interval)
     
     
     def _wsOnOpen(self, ws):
-        print("【√】WebSocket连接成功.")
+        logger.info("【√】WebSocket连接成功.")
         self._disconnect_count = 0
         self._mail_sent = False
         self.last_message_time = time.time()
+        self._incoming_frame_count = 0
+        self._parsed_message_count = 0
+        self._hb_frame_count = 0
+        self._data_frame_count = 0
+        self._debug_data_logs = 0
+        self._last_incoming_log_time = time.time()
         
         # Start the heartbeat and the new watchdog monitor
         threading.Thread(target=self._sendHeartbeat, daemon=True).start()
         threading.Thread(target=self._monitor_activity, daemon=True).start()
+
+    def _wsOnData(self, ws, data, data_type, continue_flag):
+        self._incoming_frame_count += 1
+        self.last_message_time = time.time()
+
+        if data_type == websocket.ABNF.OPCODE_BINARY and isinstance(data, (bytes, bytearray)):
+            self._process_ws_binary_frame(ws, data)
+
+        now = time.time()
+        if now - self._last_incoming_log_time >= 30:
+            logger.info(
+                f"【DataFlow】Incoming frames: {self._incoming_frame_count}, Parsed messages: {self._parsed_message_count}, HB frames: {self._hb_frame_count}, Data frames: {self._data_frame_count} (last type: {data_type})"
+            )
+            self._last_incoming_log_time = now
+
+    def _process_ws_binary_frame(self, ws, message):
+        try:
+            package = PushFrame().parse(message)
+            if package.payload_type != 'hb':
+                self.last_message_time = time.time()
+                self._data_frame_count += 1
+            else:
+                self._hb_frame_count += 1
+
+            response = Response().parse(gzip.decompress(package.payload))
+
+            if package.payload_type != 'hb' and self._debug_data_logs < 3:
+                header_map = {
+                    (h.key or ""): (h.value or "")
+                    for h in (package.headers_list or [])
+                    if getattr(h, 'key', None)
+                }
+                header_keys = list(header_map.keys())
+                logger.info(
+                    f"【DataDebug】payload_type={package.payload_type}, payload_encoding={package.payload_encoding}, "
+                    f"need_ack={response.need_ack}, fetch_type={response.fetch_type}, messages={len(response.messages_list or [])}, "
+                    f"headers={header_keys[:6]}"
+                )
+                if 'im-internal_ext' in header_map:
+                    logger.info(f"【DataDebug】im-internal_ext_len={len(header_map.get('im-internal_ext') or '')}, im-cursor_len={len(header_map.get('im-cursor') or '')}, im-live_cursor_len={len(header_map.get('im-live_cursor') or '')}")
+                self._debug_data_logs += 1
+
+            ack_internal_ext = response.internal_ext
+            if not ack_internal_ext and package.headers_list:
+                for header in package.headers_list:
+                    key = (header.key or "").lower()
+                    if key == "im-internal_ext" or "internal_ext" in key:
+                        ack_internal_ext = header.value or ""
+                        break
+
+            should_ack = response.need_ack or bool(ack_internal_ext)
+
+            if should_ack and ack_internal_ext:
+                ack = PushFrame(log_id=package.log_id, payload_type='ack',
+                                payload=ack_internal_ext.encode('utf-8')).SerializeToString()
+                ws.send(ack, websocket.ABNF.OPCODE_BINARY)
+            elif response.need_ack:
+                logger.info("【DataDebug】need_ack=True but internal_ext missing; ack skipped")
+
+            messages = response.messages_list or []
+            if not messages and package.payload_type != 'hb':
+                logger.info(f"【DataFlow】Non-HB frame with 0 messages. fetch_type={response.fetch_type}, cursor_len={len(response.cursor or '')}")
+
+            for msg in messages:
+                self._parsed_message_count += 1
+                handler = self.dispatch_map.get(msg.method)
+                if handler:
+                    handler(msg.payload)
+        except Exception as e:
+            logger.info(f"【消息解析异常】{_safe_log_text(e)}")
         
     def _wsOnMessage(self, ws, message):
-            """
-            接收到数据
-            """
-            # Update inactivity timer only for non-heartbeat messages
-            try:
-                package = PushFrame().parse(message)
-                
-                # CRITICAL: Only update activity timer if it's NOT a heartbeat ('hb')
-                # This ensures the watchdog restarts if only heartbeats are being received.
-                if package.payload_type != 'hb':
-                    self.last_message_time = time.time()
-                
-                response = Response().parse(gzip.decompress(package.payload))
-            except Exception as e:
-                # Treat messages that fail decompression/parsing as activity if they passed the pushframe check
-                print(f"【X】Message decompression/parsing failed: {e}")
-                return
-
-            if response.need_ack:
-                ack = PushFrame(
-                    log_id=package.log_id,
-                    payload_type='ack',
-                    payload=response.internal_ext.encode('utf-8')
-                ).SerializeToString()
-                ws.send(ack, websocket.ABNF.OPCODE_BINARY)
-
-            dispatch_map = self.dispatch_map 
-
-            for msg in response.messages_list:
-                method = msg.method
-                handler = dispatch_map.get(method)
-                if handler:
-                    try:
-                        handler(msg.payload)
-                    except Exception as e:
-                        print(f"【处理失败】{method}: {e}")
+            return
 
     # Batch Logging Flush Thread
     def _log_flush_thread(self):
@@ -527,7 +642,7 @@ class DouyinLiveWebFetcher:
                         writer.writerow(headers)
                     writer.writerows(rows)
             except Exception as e:
-                 print(f"【X】Log flush error for {filepath}: {e}")
+                 logger.info(f"【X】Log flush error for {filepath}: {e}")
 
 
     
@@ -550,42 +665,24 @@ class DouyinLiveWebFetcher:
             
             self.log_buffers[final_filename_key].append(row)
 
-    
-    # FIXED: Robust console encoding for errors
     def _wsOnError(self, ws, error):
-        """Handles WebSocket errors gracefully, even with console encoding issues."""
+        """核心修复：通过手动编码转换彻底解决 'charmap' 报错"""
         try:
-            # NEW: Check for NoneType before processing
-            if error is None:
-                safe_error = "Unknown Error (NoneType received)"
-            else:
-                # Get the console's output encoding, default to 'utf-8' if unavailable.
-                console_encoding = sys.stdout.encoding or 'utf-8'
-                
-                # Attempt robust encoding/decoding
-                safe_error = str(error).encode('utf-8', errors='replace').decode(console_encoding, errors='replace')
-            
-            print(f"WebSocket error: {safe_error}")
-            
+            logger.info(f"【WebSocket Error】: {_safe_log_text(error)}")
         except Exception:
-            # Fallback
-            try:
-                sys.stderr.write("WebSocket error: <unprintable>\n")
-            except Exception:
-                pass
-
-    
+            # 极端情况下的后备方案
+            logger.info("【WebSocket Error】: (无法格式化的异常消息)")
     def _wsOnClose(self, ws, close_status_code=None, close_msg=None):
         if close_status_code is not None or close_msg is not None:
-            print(f"WebSocket connection closed. Status Code: {close_status_code}, Message: {close_msg}")
+            logger.info(f"WebSocket connection closed. Status Code: {close_status_code}, Message: {close_msg}")
         else:
-            print("WebSocket connection closed.")
+            logger.info("WebSocket connection closed.")
         
         self._flush_logs() 
         
         # Check running flag to allow graceful termination
         if not self._running:
-            print("【_wsOnClose】程序已通过外部调用停止。")
+            logger.info("【_wsOnClose】程序已通过外部调用停止。")
             return
             
         self.get_room_status()
@@ -593,12 +690,12 @@ class DouyinLiveWebFetcher:
         while self._running: # Check running flag here
             room_status = self.get_room_status()
             if room_status == 0:
-                print("【√】检测到直播重新开始，尝试连接 WebSocket...")
+                logger.info("【√】检测到直播重新开始，尝试连接 WebSocket...")
                 time.sleep(5)
                 self._connectWebSocket()
                 break
             else:
-                print("【...】直播仍未开始，30秒后重试")
+                logger.info("【...】直播仍未开始，30秒后重试")
                 if not self._running: # Double check if stop was called during sleep
                     break
                 time.sleep(30)
@@ -666,12 +763,12 @@ class DouyinLiveWebFetcher:
             else:
                 display_parts.append(user_name)
 
-            print(f"【聊天msg】{' '.join(display_parts)}: {content}")
+            logger.info(f"【聊天msg】{' '.join(display_parts)}: {content}")
 
 
             # CSV 记录
             if log_to_csv:
-                headers = ["时间", "id", "昵称", "粉丝团", "财富等级", "内容"]
+                headers = ["时间", "ID", "昵称", "粉丝团" ,"财富等级", "内容"]
                 row = [
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S") if self.include_timestamp else "",
                     user_key if show_user_id else "", # Use user_key here
@@ -685,7 +782,7 @@ class DouyinLiveWebFetcher:
 
             return message
         except Exception as e:
-            print(f"【聊天msg】解析失败: {e}")
+            logger.info(f"【聊天msg】解析失败: {e}")
             return None
 
 
@@ -758,17 +855,17 @@ class DouyinLiveWebFetcher:
                 log_fans_club = data.get("fans_club", "无")
                 log_user_name = data.get("user_name", "未知用户")
                 level_info = f"[财富:{log_pay_grade}] [粉丝:{log_fans_club}]"
-                print(f"【礼物msg】{level_info} [ID:{key[0]}] {log_user_name} 最终送出 {gift_name} x{total_cnt} (价值: {total_value})")
+                logger.info(f"【礼物msg】{level_info} [ID:{key[0]}] {log_user_name} 最终送出 {gift_name} x{total_cnt} (价值: {total_value})")
                 
                 # CSV Logging
                 if self.handler_config.get("WebcastGiftMessage", {}).get("log_to_csv", False):
-                    headers = ["时间", "昵称", "用户ID (Display/Short/Long)", "粉丝团等级", "财富等级", "礼物名字", "礼物数量", "礼物价值"]
+                    headers = ["时间", "昵称", "ID", "粉丝团","财富等级", "礼物名字", "礼物数量", "礼物价值"]
                     row = [
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         log_user_name,
                         key[0],
-                        log_pay_grade,
                         log_fans_club,
+                        log_pay_grade,
                         gift_name,
                         total_cnt,
                         total_value
@@ -818,7 +915,7 @@ class DouyinLiveWebFetcher:
 
 
         except Exception as e:
-            print(f"【礼物msg】解析失败: {e}")
+            logger.info(f"【礼物msg】解析失败: {e}")
 
 
     def _parseLikeMsg(self, payload):
@@ -826,7 +923,7 @@ class DouyinLiveWebFetcher:
         message = LikeMessage().parse(payload)
         user_name = message.user.nick_name
         count = message.count
-        print(f"【点赞msg】{user_name} 点了{count}个赞")
+        logger.info(f"【点赞msg】{user_name} 点了{count}个赞")
     
     def _parseMemberMsg(self, payload):
             """进入直播间消息"""
@@ -869,26 +966,26 @@ class DouyinLiveWebFetcher:
 
                 if show_entry:
                     if long_id == 111111:
-                        print(f"【进场msg】[{gender}]{user_name} 进入了直播间")
+                        logger.info(f"【进场msg】[{gender}]{user_name} 进入了直播间")
                     else:
-                        print(f"【进场msg】[{user_key}][{gender}]{user_name} 进入了直播间")
+                        logger.info(f"【进场msg】[{user_key}][{gender}]{user_name} 进入了直播间")
 
                 # --- CSV Logging Logic ---
                 if cfg.get("log_to_csv", False):
-                    headers = ["时间", "昵称", "用户ID (Display/Short/Long)", "性别", "财富等级", "粉丝团等级"]
+                    headers = ["时间", "昵称", "ID", "性别", "粉丝团", "财富等级"]
                     row = [
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S") if self.include_timestamp else "",
                         user_name,
                         user_key,
                         gender,
-                        pay_grade,
-                        fans_club
+                        fans_club,
+                        pay_grade
                     ]
                     self.log_message(f"enter_log", headers, row)
 
                 return message
             except Exception as e:
-                print(f"【进场msg】解析失败: {e}")
+                logger.info(f"【进场msg】解析失败: {e}")
                 return None
         
     def _parseSocialMsg(self, payload):
@@ -896,7 +993,7 @@ class DouyinLiveWebFetcher:
         message = SocialMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        print(f"【关注msg】[{user_id}]{user_name} 关注了主播")
+        logger.info(f"【关注msg】[{user_id}]{user_name} 关注了主播")
     
     def _parseRoomUserSeqMsg(self, payload):
         """直播间统计"""
@@ -907,7 +1004,7 @@ class DouyinLiveWebFetcher:
 
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"【统计msg】当前观看人数: {current}, 累计观看人数: {total}")
+        logger.info(f"【统计msg】当前观看人数: {current}, 累计观看人数: {total}")
 
         cfg = self.handler_config.get("WebcastRoomUserSeqMessage", {})
         interval = cfg.get("log_interval_seconds", 10)
@@ -925,14 +1022,14 @@ class DouyinLiveWebFetcher:
                 total              
             ]
             self.log_message(f"viewer_log", headers, row)
-            print("Logging msg")
+            logger.info("Logging msg")
 
 
     def _parseFansclubMsg(self, payload):
         '''粉丝团消息'''
         message = FansclubMessage().parse(payload)
         content = message.content
-        print(f"【粉丝团msg】 {content}")
+        logger.info(f"【粉丝团msg】 {content}")
     
     def _parseEmojiChatMsg(self, payload):
         '''聊天表情包消息'''
@@ -941,110 +1038,116 @@ class DouyinLiveWebFetcher:
         user = message.user
         common = message.common
         default_content = message.default_content
-        print(f"【聊天表情包id】 {emoji_id},user：{user},common:{common},default_content:{default_content}")
+        logger.info(f"【聊天表情包id】 {emoji_id},user：{user},common:{common},default_content:{default_content}")
     
     def _parseRoomMsg(self, payload):
         message = RoomMessage().parse(payload)
         common = message.common
         room_id = common.room_id
-        print(f"【直播间msg】直播间id:{room_id}")
+        logger.info(f"【直播间msg】直播间id:{room_id}")
     
     def _parseRoomStatsMsg(self, payload):
         message = RoomStatsMessage().parse(payload)
         display_long = message.display_long
-        print(f"【直播间统计msg】{display_long}")
+        logger.info(f"【直播间统计msg】{display_long}")
     
     def _parseRankMsg(self, payload):
-        """直播间排行榜消息：使用缓存数据填充等级缺失信息。"""
-        # Helper to extract levels
-        def _extract_levels_from_message(user):
-            pay_grade_level = getattr(getattr(user, 'pay_grade', None), 'level', 0)
-            fans_club_data = getattr(getattr(user, 'fans_club', None), 'data', None)
-            fans_club_level = getattr(fans_club_data, 'level', 0)
-            
-            pay_grade_str = str(pay_grade_level) if pay_grade_level > 0 else "无"
-            fans_club_str = str(fans_club_level) if fans_club_level > 0 else "无"
-            
-            return pay_grade_str, fans_club_str
+            """直播间排行榜消息：使用缓存数据填充等级缺失信息。"""
+            # 内部辅助函数：用于提取用户等级
+            def _extract_levels_from_message(user):
+                pay_grade_level = getattr(getattr(user, 'pay_grade', None), 'level', 0)
+                fans_club_data = getattr(getattr(user, 'fans_club', None), 'data', None)
+                fans_club_level = getattr(fans_club_data, 'level', 0)
+                
+                pay_grade_str = str(pay_grade_level) if pay_grade_level > 0 else "无"
+                fans_club_str = str(fans_club_level) if fans_club_level > 0 else "无"
+                
+                return pay_grade_str, fans_club_str
 
-        try:
-            message = RoomRankMessage().parse(payload)
-            ranks_list = message.ranks_list
+            try:
+                # 解析原始消息
+                message = RoomRankMessage().parse(payload)
+                
+                # 核心修复：增加空值校验，防止连接断开时 ranks_list 为 None 导致的迭代报错
+                if not message or not hasattr(message, 'ranks_list') or message.ranks_list is None:
+                    return
 
-            print("【直播间排行榜msg】")
-            for idx, rank in enumerate(ranks_list, start=1):
-                user = getattr(rank, 'user', None)
-                if not user:
-                    print(f"  {idx}. 昵称: (用户对象缺失) | 无法获取详细信息")
-                    continue
-                
-                user_id = str(getattr(user, 'id', 0))
-                
-                # --- ID Extraction Logic for Cache Lookup ---
-                display_id = getattr(user, 'display_id', None)
-                short_id = getattr(user, 'short_id', None)
-                
-                user_key = str(display_id) if display_id and str(display_id) != '' and str(display_id) != '0' else None
-                if not user_key:
-                    user_key = str(short_id) if short_id and str(short_id) != '0' else None
-                if not user_key:
-                     user_key = user_id
-                
-                
-                # 1. 尝试从排行榜消息本身获取等级 (Primary source)
-                pay_grade, fans_club = _extract_levels_from_message(user)
-                
-                # 2. 如果等级缺失，从缓存中查找 (Secondary source)
-                cached_data = self.user_level_cache.get(user_key)
-                if cached_data:
-                    if pay_grade == '无' and cached_data.get("pay_grade"):
-                        pay_grade = cached_data["pay_grade"]
-                    if fans_club == '无' and cached_data.get("fans_club"):
-                        fans_club = cached_data["fans_club"]
-                            
-                # 昵称：使用缓存中的昵称
-                nickname = getattr(user, 'nick_name', '')
-                if not nickname:
-                    cached_name = self.user_level_cache.get(user_key, {}).get("nickname")
-                    if cached_name:
-                        nickname = cached_name
-                    elif user_key != '111111':
-                        nickname = f'（无名/{user_key}）'
-                    else:
-                        nickname = '（匿名用户）'
+                ranks_list = message.ranks_list
 
-                # 累计钻石 (从运行时内存获取)
-                diamond_total = self.user_diamond_totals.get(user_key, {}).get("diamonds", 0)
+                logger.info("【直播间排行榜msg】")
+                for idx, rank in enumerate(ranks_list, start=1):
+                    user = getattr(rank, 'user', None)
+                    if not user:
+                        logger.info(f"   {idx}. 昵称: (用户对象缺失) | 无法获取详细信息")
+                        continue
+                    
+                    user_id = str(getattr(user, 'id', 0))
+                    
+                    # --- ID 提取逻辑 (优先使用 Display ID) ---
+                    display_id = getattr(user, 'display_id', None)
+                    short_id = getattr(user, 'short_id', None)
+                    
+                    user_key = str(display_id) if display_id and str(display_id) != '' and str(display_id) != '0' else None
+                    if not user_key:
+                        user_key = str(short_id) if short_id and str(short_id) != '0' else None
+                    if not user_key:
+                        user_key = user_id
+                    
+                    # 1. 尝试从排行榜消息本身获取等级
+                    pay_grade, fans_club = _extract_levels_from_message(user)
+                    
+                    # 2. 如果等级缺失，从缓存中查找
+                    cached_data = self.user_level_cache.get(user_key)
+                    if cached_data:
+                        if pay_grade == '无' and cached_data.get("pay_grade"):
+                            pay_grade = cached_data["pay_grade"]
+                        if fans_club == '无' and cached_data.get("fans_club"):
+                            fans_club = cached_data["fans_club"]
+                                
+                    # 昵称逻辑：优先使用原始昵称，缺失则查缓存
+                    nickname = getattr(user, 'nick_name', '')
+                    if not nickname:
+                        cached_name = self.user_level_cache.get(user_key, {}).get("nickname")
+                        if cached_name:
+                            nickname = cached_name
+                        elif user_key != '111111':
+                            nickname = f'（无名/{user_key}）'
+                        else:
+                            nickname = '（匿名用户）'
 
-                print(f"  {idx}. 昵称: {nickname} | 财富等级: {pay_grade} | 粉丝团等级: {fans_club} | 累计钻石: {diamond_total}")
+                    # 累计钻石统计
+                    diamond_total = self.user_diamond_totals.get(user_key, {}).get("diamonds", 0)
 
-        except Exception as e:
-            print(f"【排行榜msg】解析失败: {e}")
+                    # 安全输出：logger 会通过之前配置的 TextIOWrapper 处理编码问题
+                    logger.info(f"   {idx}. 昵称: {nickname} | 财富等级: {pay_grade} | 粉丝团等级: {fans_club} | 累计钻石: {diamond_total}")
+
+            except Exception as e:
+                logger.info(f"【排行榜msg】解析失败: {e}")
 
             
     def _parseControlMsg(self, payload):
         """直播间状态消息"""
         message = ControlMessage().parse(payload)
 
-        print(f"【控制msg】状态码: {message.status}")
+        logger.info(f"【控制msg】状态码: {message.status}")
 
         if message.status == 2:  # 直播结束
-            print("【控制msg】直播间已结束，准备重连...")
+            logger.info("【控制msg】直播间已结束，准备重连...")
 
             # Check running flag to allow graceful termination
             if not self._running:
-                print("【控制msg】程序已通过外部调用停止。")
+                logger.info("【控制msg】程序已通过外部调用停止。")
                 return
 
             while self._running: # Check running flag here
                 room_status = self.get_room_status()
                 if room_status == 0:
-                    print("【√】检测到直播重新开始，尝试连接 WebSocket...")
+                    logger.info("【√】检测到直播重新开始，尝试连接 WebSocket...")
                     time.sleep(5)
                     self._connectWebSocket()
                     break
                 else:
-                    print("【...】直播仍未开始，30秒后重试")
+                    logger.info("【...】直播仍未开始，30秒后重试")
                     if not self._running: # Double check if stop was called during sleep
                         break
                     time.sleep(30)
@@ -1052,17 +1155,17 @@ class DouyinLiveWebFetcher:
     def _parseRoomStreamAdaptationMsg(self, payload):
         message = RoomStreamAdaptationMessage().parse(payload)
         adaptationType = message.adaptation_type
-        print(f'直播间adaptation: {adaptationType}')
+        logger.info(f'直播间adaptation: {adaptationType}')
 
     def _monitor_activity(self):
         """Monitor thread to check for silence (excluding heartbeats)."""
-        print("【Watchdog】Activity monitor started.")
+        logger.info("【Watchdog】Activity monitor started.")
         while self._running:
             # Check if WebSocket exists and is connected
             if hasattr(self, 'ws') and getattr(self.ws, 'sock', None) and self.ws.sock.connected:
                 elapsed = time.time() - self.last_message_time
                 if elapsed > self.inactivity_timeout_seconds:
-                    print(f"【Watchdog】No data for {int(elapsed)}s. Restarting connection...")
+                    logger.info(f"【Watchdog】No data for {int(elapsed)}s. Restarting connection...")
                     try:
                         self.ws.close()  # Triggers _wsOnClose and automatic reconnection
                     except:

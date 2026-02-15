@@ -2,13 +2,13 @@
   # true = 开启，false = 关闭
 
 
-  heartbeat_interval: 15 # 心跳包发送间隔（秒）
+  heartbeat_interval: 5 # 心跳包发送间隔（秒）
   retry_on_failure: true # 是否在连接失败时自动重试
   max_retries: 3 # 最大重试次数
   retry_delay_seconds: 10 # 每次重试之间的等待时间（秒）
   gift_combo_delay_seconds: 5.0 # 礼物连击时间间隔（秒）
   inactivity_interval_seconds: 300 # 多久没有消息后认为直播间不活跃（秒）
-
+  auth_cookie: ''
   logging:
     folder: 'logs' # 日志文件保存目录
     format: 'csv'  # 日志文件格式（目前仅支持 CSV）

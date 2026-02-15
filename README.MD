@@ -2,7 +2,14 @@
 
 DouyinFetcher is a Python-based tool for collecting real-time Douyin web live-room data through WebSocket + Protobuf parsing. It is designed for stable, long-running capture sessions and structured local logging.
 
-## Overall Features
+## Language / 语言
+
+- [English](#english-guide)
+- [中文](#中文说明)
+
+## English Guide
+
+### Overall Features
 
 - Real-time data capture from Douyin web live rooms.
 - Message parsing for chat, gifts, likes, member entry, room stats, fans club, rank, and control events.
@@ -14,7 +21,9 @@ DouyinFetcher is a Python-based tool for collecting real-time Douyin web live-ro
 - Session-based CSV logging for clean data separation and traceability.
 - UTF-8-safe logging for better Windows console compatibility.
 
-## 功能总览（中文）
+## 中文说明
+
+### 功能总览
 
 - 支持抖音网页版直播间实时数据抓取。
 - 支持解析聊天、礼物、点赞、进场、统计、粉丝团、排行榜、控制消息等。
@@ -25,6 +34,19 @@ DouyinFetcher is a Python-based tool for collecting real-time Douyin web live-ro
 - 用户 ID 多级回退（展示 ID -> 短 ID -> 长 ID），增强身份一致性。
 - CSV 会话化日志输出，便于数据分析与问题追溯。
 - Windows 环境下 UTF-8 友好日志输出，降低编码报错概率。
+
+### 快速开始
+
+1. 在 `main.py` 中设置 `live_id`。
+2. （可选）在 `message_handlers.yml` 中调整消息开关与日志配置。
+3. 运行 `python main.py` 开始采集。
+4. 日志默认输出到 `logs/` 目录。
+
+### Cookie 设置
+
+- 推荐在 `message_handlers.yml` 中填写 `auth_cookie` 以提高稳定性。
+- 可用浏览器 DevTools 抓取，或使用 `python get_cookie.py` 自动写入。
+- 详细说明见 [get_cookie.md](get_cookie.md)。
 
 ## Requirements
 
